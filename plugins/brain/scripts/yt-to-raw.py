@@ -13,6 +13,7 @@ If auto-captions are unavailable, falls back to whisper transcription.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -58,20 +59,47 @@ def fetch_metadata(url: str) -> dict:
 
 
 def fetch_auto_captions(url: str, staging: Path, video_id: str) -> Path | None:
-    subprocess.run(
+    """Fetch auto-captions in whatever language the video was actually spoken in
+    (not hardcoded to English) - picks the original transcribed track over the
+    dozens of auto-translated ones yt-dlp also lists (e.g. prefer plain "iw"
+    over "ab-iw" "aa-iw" etc, which are Hebrew auto-translated to other langs)."""
+    info = subprocess.run(
+        ["yt-dlp", "-j", "--skip-download", url],
+        capture_output=True, text=True,
+    )
+    if info.returncode != 0:
+        return None
+    try:
+        meta = json.loads(info.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    auto_caps = meta.get("automatic_captions") or {}
+    if not auto_caps:
+        return None
+
+    lang = meta.get("language")
+    if not lang or lang not in auto_caps:
+        # Original (non-translated) tracks are listed under a plain code with
+        # no "-" (e.g. "iw"); translated ones are "<target>-<source>".
+        originals = [k for k in auto_caps if "-" not in k]
+        lang = originals[0] if originals else next(iter(auto_caps))
+
+    result = subprocess.run(
         [
             "yt-dlp",
             "--write-auto-sub",
             "--skip-download",
-            "--sub-lang", "en",
+            "--sub-lang", lang,
             "--sub-format", "vtt",
             url,
             "-o", str(staging / f"{video_id}.%(ext)s"),
         ],
-        check=True,
         capture_output=True,
     )
-    vtt = staging / f"{video_id}.en.vtt"
+    if result.returncode != 0:
+        return None
+    vtt = staging / f"{video_id}.{lang}.vtt"
     return vtt if vtt.exists() else None
 
 
@@ -97,7 +125,6 @@ def transcribe_with_whisper(audio_path: Path) -> str:
             "--model", "small",
             "--output_format", "txt",
             "--output_dir", str(audio_path.parent),
-            "--language", "en",
             "--verbose", "False",
         ],
         capture_output=True,
